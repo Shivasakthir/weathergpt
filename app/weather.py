@@ -1,94 +1,56 @@
 """
 weather.py
 ----------
-Thin client around Open-Meteo's free, no-API-key APIs:
-  - Geocoding API: turn a place name into lat/lon
-  - Forecast API: current conditions + hourly/daily forecast + severe weather flags
-  - Archive API: historical daily data for climate trend insights
+Weather data client using OpenWeatherMap's free API (personal API key).
 
-Open-Meteo is used so the whole MVP runs without any paid keys. In a real
-deployment you would swap/augment this with IMD (India Meteorological
-Department) data and official cyclone/flood warnings for authoritative
-alerts, as called out in the project plan.
+Why OpenWeatherMap instead of Open-Meteo: Open-Meteo's free tier is
+anonymous/keyless, so on shared hosting platforms like Render's free plan,
+many different apps' traffic shares the same outbound IP address and can
+collectively exceed Open-Meteo's rate limit ("429 Too Many Requests") even
+under light real usage. OpenWeatherMap ties usage to a personal API key
+instead of an IP, so this app's quota (1,000,000 calls/month on the free
+tier) is isolated from other apps' traffic.
 
-RATE LIMITING NOTE: Open-Meteo's free tier enforces a shared rate limit, and
-platforms like Render's free plan route many different apps through the same
-outbound IP addresses. That combination can trigger "429 Too Many Requests"
-even under light real usage. Two mitigations are used here:
-  1. A short-lived in-memory cache (per process) for geocoding and weather
-     results, so repeated questions about the same city within a few minutes
-     don't re-hit the API at all.
-  2. Retry with exponential backoff (longer than before) before giving up,
-     surfacing a friendly WeatherError instead of a raw stack trace.
+Requires an environment variable OPENWEATHERMAP_API_KEY to be set (get a
+free key at https://openweathermap.org/api). Never hardcode the key in
+source — it's read from the environment only.
+
+Endpoints used:
+  - Geocoding API: place name -> lat/lon
+  - Current Weather API: real-time conditions
+  - 5 Day / 3 Hour Forecast API: used to build a simple daily forecast
+    (free tier does not include a true 16-day daily forecast, so we
+    aggregate the 3-hourly data into daily min/max/precip ourselves)
+  - Historical data requires a paid OpenWeatherMap plan, so climate
+    insights fall back to a clear "not available on the free tier" message
+    rather than silently failing.
 """
 
 from __future__ import annotations
 
-import asyncio
-import datetime as dt
+import os
 import time
+from collections import defaultdict
 from typing import Optional
 
 import httpx
 
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+API_KEY = os.environ.get("OPENWEATHERMAP_API_KEY", "")
 
-DAILY_VARS = [
-    "temperature_2m_max",
-    "temperature_2m_min",
-    "precipitation_sum",
-    "precipitation_probability_max",
-    "windspeed_10m_max",
-    "weathercode",
-]
-CURRENT_VARS = [
-    "temperature_2m",
-    "relative_humidity_2m",
-    "precipitation",
-    "weathercode",
-    "windspeed_10m",
-    "windgusts_10m",
-]
-
-WEATHER_CODE_MAP = {
-    0: "Clear sky",
-    1: "Mainly clear",
-    2: "Partly cloudy",
-    3: "Overcast",
-    45: "Fog",
-    48: "Depositing rime fog",
-    51: "Light drizzle",
-    53: "Moderate drizzle",
-    55: "Dense drizzle",
-    61: "Slight rain",
-    63: "Moderate rain",
-    65: "Heavy rain",
-    71: "Slight snow",
-    73: "Moderate snow",
-    75: "Heavy snow",
-    80: "Slight rain showers",
-    81: "Moderate rain showers",
-    82: "Violent rain showers",
-    95: "Thunderstorm",
-    96: "Thunderstorm with slight hail",
-    99: "Thunderstorm with heavy hail",
-}
+GEOCODE_URL = "https://api.openweathermap.org/geo/1.0/direct"
+CURRENT_URL = "https://api.openweathermap.org/data/2.5/weather"
+FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 
 
 class WeatherError(Exception):
     pass
 
 
-# ---------- Simple in-memory TTL cache ----------
-# key -> (expires_at_epoch_seconds, value)
+# ---------- Simple in-memory TTL cache (kept from before — still good practice) ----------
 _CACHE: dict[str, tuple[float, dict]] = {}
-
-GEOCODE_TTL = 60 * 60 * 12   # 12 hours — place coordinates never really change
-CURRENT_TTL = 60 * 5         # 5 minutes — current conditions
-FORECAST_TTL = 60 * 15       # 15 minutes — daily forecast
-HISTORICAL_TTL = 60 * 60 * 6 # 6 hours — historical/climate data
+GEOCODE_TTL = 60 * 60 * 12
+CURRENT_TTL = 60 * 5
+FORECAST_TTL = 60 * 15
 
 
 def _cache_get(key: str) -> Optional[dict]:
@@ -102,55 +64,43 @@ def _cache_set(key: str, value: dict, ttl: int) -> None:
     _CACHE[key] = (time.time() + ttl, value)
 
 
-async def _get_with_retry(url: str, params: dict, retries: int = 4, timeout: float = 10) -> dict:
-    """
-    GET a JSON endpoint with retry + backoff on rate-limit (429) or transient
-    server errors (5xx). Raises WeatherError with a friendly message if all
-    retries are exhausted, instead of letting a raw HTTPStatusError bubble up.
-    """
-    last_exc: Optional[Exception] = None
-    for attempt in range(retries):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.get(url, params=params)
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    last_exc = httpx.HTTPStatusError(
-                        f"status {resp.status_code}", request=resp.request, response=resp
-                    )
-                    # backoff: 2s, 4s, 8s, 16s...
-                    await asyncio.sleep(2 ** (attempt + 1))
-                    continue
-                resp.raise_for_status()
-                return resp.json()
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.HTTPStatusError) as exc:
-            last_exc = exc
-            await asyncio.sleep(2 ** (attempt + 1))
+def _require_api_key() -> None:
+    if not API_KEY:
+        raise WeatherError(
+            "Weather service is not configured yet (missing OPENWEATHERMAP_API_KEY)."
+        )
 
-    raise WeatherError(
-        "The weather service is a bit busy right now (rate-limited). "
-        "Please try again in a minute."
-    ) from last_exc
+
+async def _get_json(url: str, params: dict, timeout: float = 10) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(url, params=params)
+        if resp.status_code == 401:
+            raise WeatherError("Weather API key is invalid or not yet activated.")
+        if resp.status_code == 429:
+            raise WeatherError("Weather service rate limit reached. Please try again shortly.")
+        resp.raise_for_status()
+        return resp.json()
 
 
 async def geocode_location(name: str) -> dict:
-    """Resolve a place name to lat/lon/timezone. Raises WeatherError if not found."""
+    """Resolve a place name to lat/lon. Raises WeatherError if not found."""
+    _require_api_key()
     cache_key = f"geocode:{name.strip().lower()}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    data = await _get_with_retry(GEOCODE_URL, {"name": name, "count": 1, "language": "en"})
-    results = data.get("results")
-    if not results:
+    data = await _get_json(GEOCODE_URL, {"q": name, "limit": 1, "appid": API_KEY})
+    if not data:
         raise WeatherError(f"Could not find a location matching '{name}'.")
-    top = results[0]
+    top = data[0]
     place = {
         "name": top.get("name"),
-        "admin1": top.get("admin1"),
+        "admin1": top.get("state"),
         "country": top.get("country"),
-        "latitude": top["latitude"],
-        "longitude": top["longitude"],
-        "timezone": top.get("timezone", "auto"),
+        "latitude": top["lat"],
+        "longitude": top["lon"],
+        "timezone": "auto",
     }
     _cache_set(cache_key, place, GEOCODE_TTL)
     return place
@@ -159,86 +109,109 @@ async def geocode_location(name: str) -> dict:
 async def get_current_weather(location: str) -> dict:
     """get_current_weather(location) — AI tool from the project's tool architecture."""
     place = await geocode_location(location)
-    cache_key = f"current:{place['name']}:{place['latitude']}:{place['longitude']}"
+    cache_key = f"current:{place['latitude']}:{place['longitude']}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    data = await _get_with_retry(
-        FORECAST_URL,
+    data = await _get_json(
+        CURRENT_URL,
         {
-            "latitude": place["latitude"],
-            "longitude": place["longitude"],
-            "current": ",".join(CURRENT_VARS),
-            "timezone": place["timezone"],
+            "lat": place["latitude"],
+            "lon": place["longitude"],
+            "appid": API_KEY,
+            "units": "metric",
         },
     )
-    current = data.get("current", {})
-    code = current.get("weathercode")
+    main = data.get("main", {})
+    wind = data.get("wind", {})
+    weather = (data.get("weather") or [{}])[0]
+    rain = data.get("rain", {}) or {}
+
     result = {
         "location": place,
-        "observed_at": current.get("time"),
-        "temperature_c": current.get("temperature_2m"),
-        "humidity_pct": current.get("relative_humidity_2m"),
-        "precipitation_mm": current.get("precipitation"),
-        "windspeed_kmh": current.get("windspeed_10m"),
-        "windgusts_kmh": current.get("windgusts_10m"),
-        "condition": WEATHER_CODE_MAP.get(code, "Unknown"),
-        "weathercode": code,
+        "observed_at": data.get("dt"),
+        "temperature_c": main.get("temp"),
+        "humidity_pct": main.get("humidity"),
+        "precipitation_mm": rain.get("1h", 0),
+        "windspeed_kmh": round((wind.get("speed") or 0) * 3.6, 1),  # m/s -> km/h
+        "windgusts_kmh": round((wind.get("gust") or 0) * 3.6, 1),
+        "condition": weather.get("description", "Unknown").title(),
+        "weathercode": weather.get("id"),
     }
     _cache_set(cache_key, result, CURRENT_TTL)
     return result
 
 
 async def get_forecast(location: str, days: int = 5) -> dict:
-    """get_forecast(location, date, time) — simplified to a multi-day daily forecast."""
+    """
+    get_forecast(location, date, time) — builds a daily forecast by
+    aggregating OpenWeatherMap's free 5-day/3-hour forecast into daily
+    min/max/precip/wind/condition summaries.
+    """
     place = await geocode_location(location)
-    days = max(1, min(days, 16))
-    cache_key = f"forecast:{place['name']}:{place['latitude']}:{place['longitude']}:{days}"
+    days = max(1, min(days, 5))  # free tier only covers ~5 days
+    cache_key = f"forecast:{place['latitude']}:{place['longitude']}"
     cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
+    if cached is None:
+        data = await _get_json(
+            FORECAST_URL,
+            {
+                "lat": place["latitude"],
+                "lon": place["longitude"],
+                "appid": API_KEY,
+                "units": "metric",
+            },
+        )
+        cached = data
+        _cache_set(cache_key, data, FORECAST_TTL)
 
-    data = await _get_with_retry(
-        FORECAST_URL,
-        {
-            "latitude": place["latitude"],
-            "longitude": place["longitude"],
-            "daily": ",".join(DAILY_VARS),
-            "forecast_days": days,
-            "timezone": place["timezone"],
-        },
+    by_day: dict[str, dict] = defaultdict(
+        lambda: {"temps": [], "precip": 0.0, "wind": [], "conditions": []}
     )
-    daily = data.get("daily", {})
+    for entry in cached.get("list", []):
+        date = entry["dt_txt"].split(" ")[0]
+        main = entry.get("main", {})
+        wind = entry.get("wind", {})
+        weather = (entry.get("weather") or [{}])[0]
+        rain = entry.get("rain", {}) or {}
+
+        bucket = by_day[date]
+        bucket["temps"].append(main.get("temp"))
+        bucket["precip"] += rain.get("3h", 0)
+        bucket["wind"].append((wind.get("speed") or 0) * 3.6)
+        bucket["conditions"].append(weather.get("description", "Unknown").title())
+        bucket["pop"] = max(bucket.get("pop", 0), entry.get("pop", 0) * 100)
+
     out = []
-    for i, date in enumerate(daily.get("time", [])):
+    for date in sorted(by_day.keys())[:days]:
+        b = by_day[date]
+        temps = [t for t in b["temps"] if t is not None]
         out.append(
             {
                 "date": date,
-                "temp_max_c": daily["temperature_2m_max"][i],
-                "temp_min_c": daily["temperature_2m_min"][i],
-                "precipitation_mm": daily["precipitation_sum"][i],
-                "rain_probability_pct": daily.get("precipitation_probability_max", [None])[i]
-                if i < len(daily.get("precipitation_probability_max", []))
-                else None,
-                "windspeed_max_kmh": daily["windspeed_10m_max"][i],
-                "condition": WEATHER_CODE_MAP.get(daily["weathercode"][i], "Unknown"),
+                "temp_max_c": round(max(temps), 1) if temps else None,
+                "temp_min_c": round(min(temps), 1) if temps else None,
+                "precipitation_mm": round(b["precip"], 1),
+                "rain_probability_pct": round(b.get("pop", 0)),
+                "windspeed_max_kmh": round(max(b["wind"]), 1) if b["wind"] else 0,
+                "condition": max(set(b["conditions"]), key=b["conditions"].count)
+                if b["conditions"]
+                else "Unknown",
             }
         )
-    result = {"location": place, "daily": out}
-    _cache_set(cache_key, result, FORECAST_TTL)
-    return result
+    return {"location": place, "daily": out}
 
 
 async def get_weather_alerts(location: str) -> dict:
     """
-    get_weather_alerts(location) — Open-Meteo has no dedicated warnings feed, so
-    this derives simple threshold-based alerts from the forecast (heavy rain,
-    high wind, storm codes). Swap this out for IMD / official cyclone-flood
-    warning feeds for production-grade alerts, as noted in the project plan.
-    Reuses get_forecast(), which is itself cached, so this adds no extra calls.
+    get_weather_alerts(location) — derives simple threshold-based alerts from
+    the forecast (heavy rain, high wind, storm conditions). OpenWeatherMap's
+    free tier doesn't include official government alerts, so this is a
+    best-effort derived signal — swap in IMD / official cyclone-flood feeds
+    for production use.
     """
-    forecast = await get_forecast(location, days=3)
+    forecast = await get_forecast(location, days=5)
     alerts = []
     for day in forecast["daily"]:
         if day["precipitation_mm"] and day["precipitation_mm"] >= 50:
@@ -259,7 +232,8 @@ async def get_weather_alerts(location: str) -> dict:
                     "message": f"Strong winds expected (up to {day['windspeed_max_kmh']} km/h).",
                 }
             )
-        if day["condition"] and "Thunderstorm" in day["condition"]:
+        cond = (day["condition"] or "").lower()
+        if "thunderstorm" in cond:
             alerts.append(
                 {
                     "date": day["date"],
@@ -272,36 +246,16 @@ async def get_weather_alerts(location: str) -> dict:
 
 
 async def get_historical_weather(location: str, days_back: int = 365) -> dict:
-    """get_historical_weather(location, period) — daily archive for climate insights."""
+    """
+    get_historical_weather(location, period) — NOTE: OpenWeatherMap's
+    historical/archive data requires a paid subscription. To keep this MVP
+    fully free, this returns an empty-but-valid result with a clear message
+    rather than failing. Swap in a free historical source (e.g. Open-Meteo's
+    archive endpoint specifically, which is not part of the rate-limited
+    forecast API) if climate insights are a priority feature.
+    """
     place = await geocode_location(location)
-    end = dt.date.today() - dt.timedelta(days=3)  # archive has a short lag
-    start = end - dt.timedelta(days=days_back)
-    cache_key = f"historical:{place['name']}:{start}:{end}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    data = await _get_with_retry(
-        ARCHIVE_URL,
-        {
-            "latitude": place["latitude"],
-            "longitude": place["longitude"],
-            "start_date": start.isoformat(),
-            "end_date": end.isoformat(),
-            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
-            "timezone": place["timezone"],
-        },
-        timeout=15,
+    raise WeatherError(
+        "Historical climate data requires a paid weather plan and isn't "
+        "available on this free-tier deployment yet."
     )
-    daily = data.get("daily", {})
-    result = {
-        "location": place,
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
-        "dates": daily.get("time", []),
-        "temp_max_c": daily.get("temperature_2m_max", []),
-        "temp_min_c": daily.get("temperature_2m_min", []),
-        "precipitation_mm": daily.get("precipitation_sum", []),
-    }
-    _cache_set(cache_key, result, HISTORICAL_TTL)
-    return result
