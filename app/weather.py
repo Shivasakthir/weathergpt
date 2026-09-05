@@ -11,18 +11,22 @@ deployment you would swap/augment this with IMD (India Meteorological
 Department) data and official cyclone/flood warnings for authoritative
 alerts, as called out in the project plan.
 
-NOTE: Open-Meteo's free tier enforces a shared rate limit. On platforms like
-Render's free plan, many apps share the same outbound IP, so occasional
-"429 Too Many Requests" errors can happen even under light real usage. All
-network calls below retry a couple of times with a short backoff before
-giving up, and raise a clean WeatherError with a friendly message instead
-of a raw stack trace.
+RATE LIMITING NOTE: Open-Meteo's free tier enforces a shared rate limit, and
+platforms like Render's free plan route many different apps through the same
+outbound IP addresses. That combination can trigger "429 Too Many Requests"
+even under light real usage. Two mitigations are used here:
+  1. A short-lived in-memory cache (per process) for geocoding and weather
+     results, so repeated questions about the same city within a few minutes
+     don't re-hit the API at all.
+  2. Retry with exponential backoff (longer than before) before giving up,
+     surfacing a friendly WeatherError instead of a raw stack trace.
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import time
 from typing import Optional
 
 import httpx
@@ -77,7 +81,28 @@ class WeatherError(Exception):
     pass
 
 
-async def _get_with_retry(url: str, params: dict, retries: int = 3, timeout: float = 10) -> dict:
+# ---------- Simple in-memory TTL cache ----------
+# key -> (expires_at_epoch_seconds, value)
+_CACHE: dict[str, tuple[float, dict]] = {}
+
+GEOCODE_TTL = 60 * 60 * 12   # 12 hours — place coordinates never really change
+CURRENT_TTL = 60 * 5         # 5 minutes — current conditions
+FORECAST_TTL = 60 * 15       # 15 minutes — daily forecast
+HISTORICAL_TTL = 60 * 60 * 6 # 6 hours — historical/climate data
+
+
+def _cache_get(key: str) -> Optional[dict]:
+    entry = _CACHE.get(key)
+    if entry and entry[0] > time.time():
+        return entry[1]
+    return None
+
+
+def _cache_set(key: str, value: dict, ttl: int) -> None:
+    _CACHE[key] = (time.time() + ttl, value)
+
+
+async def _get_with_retry(url: str, params: dict, retries: int = 4, timeout: float = 10) -> dict:
     """
     GET a JSON endpoint with retry + backoff on rate-limit (429) or transient
     server errors (5xx). Raises WeatherError with a friendly message if all
@@ -92,29 +117,34 @@ async def _get_with_retry(url: str, params: dict, retries: int = 3, timeout: flo
                     last_exc = httpx.HTTPStatusError(
                         f"status {resp.status_code}", request=resp.request, response=resp
                     )
-                    # backoff: 1s, 2s, 4s...
-                    await asyncio.sleep(2 ** attempt)
+                    # backoff: 2s, 4s, 8s, 16s...
+                    await asyncio.sleep(2 ** (attempt + 1))
                     continue
                 resp.raise_for_status()
                 return resp.json()
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.HTTPStatusError) as exc:
             last_exc = exc
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** (attempt + 1))
 
     raise WeatherError(
         "The weather service is a bit busy right now (rate-limited). "
-        "Please try again in a few seconds."
+        "Please try again in a minute."
     ) from last_exc
 
 
 async def geocode_location(name: str) -> dict:
     """Resolve a place name to lat/lon/timezone. Raises WeatherError if not found."""
+    cache_key = f"geocode:{name.strip().lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     data = await _get_with_retry(GEOCODE_URL, {"name": name, "count": 1, "language": "en"})
     results = data.get("results")
     if not results:
         raise WeatherError(f"Could not find a location matching '{name}'.")
     top = results[0]
-    return {
+    place = {
         "name": top.get("name"),
         "admin1": top.get("admin1"),
         "country": top.get("country"),
@@ -122,11 +152,18 @@ async def geocode_location(name: str) -> dict:
         "longitude": top["longitude"],
         "timezone": top.get("timezone", "auto"),
     }
+    _cache_set(cache_key, place, GEOCODE_TTL)
+    return place
 
 
 async def get_current_weather(location: str) -> dict:
     """get_current_weather(location) — AI tool from the project's tool architecture."""
     place = await geocode_location(location)
+    cache_key = f"current:{place['name']}:{place['latitude']}:{place['longitude']}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     data = await _get_with_retry(
         FORECAST_URL,
         {
@@ -138,7 +175,7 @@ async def get_current_weather(location: str) -> dict:
     )
     current = data.get("current", {})
     code = current.get("weathercode")
-    return {
+    result = {
         "location": place,
         "observed_at": current.get("time"),
         "temperature_c": current.get("temperature_2m"),
@@ -149,12 +186,19 @@ async def get_current_weather(location: str) -> dict:
         "condition": WEATHER_CODE_MAP.get(code, "Unknown"),
         "weathercode": code,
     }
+    _cache_set(cache_key, result, CURRENT_TTL)
+    return result
 
 
 async def get_forecast(location: str, days: int = 5) -> dict:
     """get_forecast(location, date, time) — simplified to a multi-day daily forecast."""
     place = await geocode_location(location)
     days = max(1, min(days, 16))
+    cache_key = f"forecast:{place['name']}:{place['latitude']}:{place['longitude']}:{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     data = await _get_with_retry(
         FORECAST_URL,
         {
@@ -181,7 +225,9 @@ async def get_forecast(location: str, days: int = 5) -> dict:
                 "condition": WEATHER_CODE_MAP.get(daily["weathercode"][i], "Unknown"),
             }
         )
-    return {"location": place, "daily": out}
+    result = {"location": place, "daily": out}
+    _cache_set(cache_key, result, FORECAST_TTL)
+    return result
 
 
 async def get_weather_alerts(location: str) -> dict:
@@ -190,6 +236,7 @@ async def get_weather_alerts(location: str) -> dict:
     this derives simple threshold-based alerts from the forecast (heavy rain,
     high wind, storm codes). Swap this out for IMD / official cyclone-flood
     warning feeds for production-grade alerts, as noted in the project plan.
+    Reuses get_forecast(), which is itself cached, so this adds no extra calls.
     """
     forecast = await get_forecast(location, days=3)
     alerts = []
@@ -229,6 +276,11 @@ async def get_historical_weather(location: str, days_back: int = 365) -> dict:
     place = await geocode_location(location)
     end = dt.date.today() - dt.timedelta(days=3)  # archive has a short lag
     start = end - dt.timedelta(days=days_back)
+    cache_key = f"historical:{place['name']}:{start}:{end}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     data = await _get_with_retry(
         ARCHIVE_URL,
         {
@@ -242,7 +294,7 @@ async def get_historical_weather(location: str, days_back: int = 365) -> dict:
         timeout=15,
     )
     daily = data.get("daily", {})
-    return {
+    result = {
         "location": place,
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
@@ -251,3 +303,5 @@ async def get_historical_weather(location: str, days_back: int = 365) -> dict:
         "temp_min_c": daily.get("temperature_2m_min", []),
         "precipitation_mm": daily.get("precipitation_sum", []),
     }
+    _cache_set(cache_key, result, HISTORICAL_TTL)
+    return result
