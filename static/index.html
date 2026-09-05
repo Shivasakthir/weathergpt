@@ -4,6 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>WeatherGPT</title>
+<link rel="manifest" href="/static/manifest.json" />
+<meta name="theme-color" content="#0b1220" />
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
@@ -442,6 +444,11 @@ document.getElementById("insightLoad").addEventListener("click", async () => {
     summaryBox.innerHTML = "Could not load historical data.";
   }
 });
+if ('serviceWorker' in navigator) {
+ window.addEventListener('load', () => {
+ navigator.serviceWorker.register('/static/service-worker.js');
+  });
+}
 </script>
 
 </body>
