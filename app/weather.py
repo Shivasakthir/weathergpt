@@ -10,10 +10,18 @@ Open-Meteo is used so the whole MVP runs without any paid keys. In a real
 deployment you would swap/augment this with IMD (India Meteorological
 Department) data and official cyclone/flood warnings for authoritative
 alerts, as called out in the project plan.
+
+NOTE: Open-Meteo's free tier enforces a shared rate limit. On platforms like
+Render's free plan, many apps share the same outbound IP, so occasional
+"429 Too Many Requests" errors can happen even under light real usage. All
+network calls below retry a couple of times with a short backoff before
+giving up, and raise a clean WeatherError with a friendly message instead
+of a raw stack trace.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from typing import Optional
 
@@ -69,12 +77,39 @@ class WeatherError(Exception):
     pass
 
 
+async def _get_with_retry(url: str, params: dict, retries: int = 3, timeout: float = 10) -> dict:
+    """
+    GET a JSON endpoint with retry + backoff on rate-limit (429) or transient
+    server errors (5xx). Raises WeatherError with a friendly message if all
+    retries are exhausted, instead of letting a raw HTTPStatusError bubble up.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    last_exc = httpx.HTTPStatusError(
+                        f"status {resp.status_code}", request=resp.request, response=resp
+                    )
+                    # backoff: 1s, 2s, 4s...
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.HTTPStatusError) as exc:
+            last_exc = exc
+            await asyncio.sleep(2 ** attempt)
+
+    raise WeatherError(
+        "The weather service is a bit busy right now (rate-limited). "
+        "Please try again in a few seconds."
+    ) from last_exc
+
+
 async def geocode_location(name: str) -> dict:
     """Resolve a place name to lat/lon/timezone. Raises WeatherError if not found."""
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(GEOCODE_URL, params={"name": name, "count": 1, "language": "en"})
-        resp.raise_for_status()
-        data = resp.json()
+    data = await _get_with_retry(GEOCODE_URL, {"name": name, "count": 1, "language": "en"})
     results = data.get("results")
     if not results:
         raise WeatherError(f"Could not find a location matching '{name}'.")
@@ -92,18 +127,15 @@ async def geocode_location(name: str) -> dict:
 async def get_current_weather(location: str) -> dict:
     """get_current_weather(location) — AI tool from the project's tool architecture."""
     place = await geocode_location(location)
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            FORECAST_URL,
-            params={
-                "latitude": place["latitude"],
-                "longitude": place["longitude"],
-                "current": ",".join(CURRENT_VARS),
-                "timezone": place["timezone"],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    data = await _get_with_retry(
+        FORECAST_URL,
+        {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "current": ",".join(CURRENT_VARS),
+            "timezone": place["timezone"],
+        },
+    )
     current = data.get("current", {})
     code = current.get("weathercode")
     return {
@@ -123,19 +155,16 @@ async def get_forecast(location: str, days: int = 5) -> dict:
     """get_forecast(location, date, time) — simplified to a multi-day daily forecast."""
     place = await geocode_location(location)
     days = max(1, min(days, 16))
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            FORECAST_URL,
-            params={
-                "latitude": place["latitude"],
-                "longitude": place["longitude"],
-                "daily": ",".join(DAILY_VARS),
-                "forecast_days": days,
-                "timezone": place["timezone"],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    data = await _get_with_retry(
+        FORECAST_URL,
+        {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "daily": ",".join(DAILY_VARS),
+            "forecast_days": days,
+            "timezone": place["timezone"],
+        },
+    )
     daily = data.get("daily", {})
     out = []
     for i, date in enumerate(daily.get("time", [])):
@@ -200,20 +229,18 @@ async def get_historical_weather(location: str, days_back: int = 365) -> dict:
     place = await geocode_location(location)
     end = dt.date.today() - dt.timedelta(days=3)  # archive has a short lag
     start = end - dt.timedelta(days=days_back)
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            ARCHIVE_URL,
-            params={
-                "latitude": place["latitude"],
-                "longitude": place["longitude"],
-                "start_date": start.isoformat(),
-                "end_date": end.isoformat(),
-                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
-                "timezone": place["timezone"],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    data = await _get_with_retry(
+        ARCHIVE_URL,
+        {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+            "timezone": place["timezone"],
+        },
+        timeout=15,
+    )
     daily = data.get("daily", {})
     return {
         "location": place,
