@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WeatherGPT</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b1220;
+    --panel: #121b2e;
+    --panel2: #172239;
+    --accent: #4fb8ff;
+    --accent2: #6ee7b7;
+    --text: #e8eefb;
+    --muted: #93a2bd;
+    --low: #4ade80;
+    --mod: #fbbf24;
+    --high: #fb923c;
+    --severe: #f87171;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: linear-gradient(160deg, #0b1220 0%, #0e1830 100%);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 24px;
+    border-bottom: 1px solid #1e2c48;
+  }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: 0.5px; }
+  header h1 span { color: var(--accent); }
+  header .tagline { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  nav { display: flex; gap: 6px; padding: 12px 24px; flex-wrap: wrap; }
+  nav button {
+    background: var(--panel);
+    color: var(--muted);
+    border: 1px solid #223250;
+    padding: 8px 16px;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  nav button.active { background: var(--accent); color: #04101f; border-color: var(--accent); font-weight: 600; }
+  main { padding: 0 24px 40px; max-width: 1100px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid #1e2c48; border-radius: var(--radius); padding: 20px; margin-bottom: 20px; }
+  .screen { display: none; }
+  .screen.active { display: block; }
+
+  /* Chat */
+  #chatWindow { height: 380px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 6px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 14px; line-height: 1.4; font-size: 14px; }
+  .msg.user { align-self: flex-end; background: var(--accent); color: #04101f; border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: var(--panel2); border-bottom-left-radius: 4px; }
+  .chip-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 16px; }
+  .chip { background: var(--panel2); border: 1px solid #223250; color: var(--muted); padding: 6px 12px; border-radius: 999px; font-size: 12px; cursor: pointer; }
+  .chip:hover { color: var(--text); border-color: var(--accent); }
+  .input-row { display: flex; gap: 8px; }
+  .input-row input[type=text] {
+    flex: 1; padding: 12px 14px; border-radius: 10px; border: 1px solid #223250;
+    background: #0e1830; color: var(--text); font-size: 14px;
+  }
+  .input-row button {
+    padding: 12px 16px; border-radius: 10px; border: none; background: var(--accent);
+    color: #04101f; font-weight: 600; cursor: pointer;
+  }
+  #micBtn { background: var(--panel2); color: var(--text); border: 1px solid #223250; }
+  #micBtn.listening { background: var(--severe); color: white; }
+  .lang-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+  .lang-toggle select { background: #0e1830; color: var(--text); border: 1px solid #223250; border-radius: 8px; padding: 4px 8px; }
+
+  /* Map */
+  #map { height: 420px; border-radius: var(--radius); overflow: hidden; }
+  .risk-legend { display: flex; gap: 14px; margin-top: 12px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .risk-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+
+  /* Alerts */
+  .alert-card { border-left: 4px solid var(--mod); background: var(--panel2); padding: 12px 16px; border-radius: 10px; margin-bottom: 10px; }
+  .alert-card.High { border-color: var(--high); }
+  .alert-card.Severe { border-color: var(--severe); }
+  .alert-card.Moderate { border-color: var(--mod); }
+  .alert-card .sev { font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+  /* Insights */
+  canvas { max-width: 100%; }
+  label { font-size: 13px; color: var(--muted); }
+  input[type=text].location-input {
+    padding: 10px 12px; border-radius: 8px; border: 1px solid #223250; background: #0e1830; color: var(--text);
+    margin-right: 8px; margin-bottom: 10px;
+  }
+  select.activity-select { padding: 10px 12px; border-radius: 8px; border: 1px solid #223250; background: #0e1830; color: var(--text); }
+  button.primary { background: var(--accent); border: none; color: #04101f; font-weight: 600; padding: 10px 18px; border-radius: 8px; cursor: pointer; }
+  .result-box { margin-top: 16px; padding: 14px; background: var(--panel2); border-radius: 10px; font-size: 14px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+  .badge.Low { background: rgba(74,222,128,0.15); color: var(--low); }
+  .badge.Moderate { background: rgba(251,191,36,0.15); color: var(--mod); }
+  .badge.High { background: rgba(251,146,60,0.15); color: var(--high); }
+  .badge.Severe { background: rgba(248,113,113,0.15); color: var(--severe); }
+  .muted { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Weather<span>GPT</span></h1>
+    <div class="tagline">AI-powered weather decision-support — multilingual, location-aware, grounded in real data</div>
+  </div>
+</header>
+
+<nav>
+  <button data-screen="chat" class="active">💬 Chat</button>
+  <button data-screen="advisory">🧭 What Should I Do?</button>
+  <button data-screen="map">🗺️ Risk Map</button>
+  <button data-screen="alerts">⚠️ Alerts</button>
+  <button data-screen="insights">📈 Insights</button>
+</nav>
+
+<main>
+
+  <!-- CHAT SCREEN -->
+  <section id="screen-chat" class="screen active panel">
+    <div class="lang-toggle">
+      <span>Voice / reply language:</span>
+      <select id="langSelect">
+        <option value="en-US">English</option>
+        <option value="ta-IN">Tamil (தமிழ்)</option>
+      </select>
+    </div>
+    <div id="chatWindow"></div>
+    <div class="chip-row">
+      <div class="chip" data-q="Will it rain in Chennai tomorrow?">Will it rain in Chennai tomorrow?</div>
+      <div class="chip" data-q="Any weather alerts for Madurai?">Any weather alerts for Madurai?</div>
+      <div class="chip" data-q="Climate trend for Coimbatore">Climate trend for Coimbatore</div>
+      <div class="chip" data-q="Should I irrigate my field in Trichy tomorrow?">Should I irrigate in Trichy tomorrow?</div>
+    </div>
+    <div class="input-row">
+      <button id="micBtn" title="Voice input">🎤</button>
+      <input type="text" id="chatInput" placeholder="Ask about weather... e.g. 'Will it rain in Madurai tomorrow evening?'" />
+      <button id="sendBtn">Send</button>
+    </div>
+    <p class="muted" style="margin-top:10px;">Voice input/output uses your browser's built-in speech recognition & synthesis (Web Speech API) — works best in Chrome. No external voice service required for the demo.</p>
+  </section>
+
+  <!-- ADVISORY SCREEN -->
+  <section id="screen-advisory" class="screen panel">
+    <h3 style="margin-top:0;">What Should I Do?</h3>
+    <p class="muted">Combines forecast, risk score, and activity rules into a concrete recommendation.</p>
+    <input type="text" class="location-input" id="advLocation" placeholder="Location, e.g. Madurai" />
+    <select class="activity-select" id="advActivity">
+      <option value="farming">Farming / Irrigation</option>
+      <option value="travel">Travel</option>
+      <option value="fishing">Fishing</option>
+      <option value="outdoor">Outdoor Event</option>
+      <option value="aviation">Aviation</option>
+    </select>
+    <select class="activity-select" id="advDays">
+      <option value="0">Today</option>
+      <option value="1">Tomorrow</option>
+      <option value="2">In 2 days</option>
+      <option value="3">In 3 days</option>
+    </select>
+    <br/><br/>
+    <button class="primary" id="advSubmit">Get Advisory</button>
+    <div id="advResult"></div>
+  </section>
+
+  <!-- MAP SCREEN -->
+  <section id="screen-map" class="screen panel">
+    <h3 style="margin-top:0;">Weather Risk Map</h3>
+    <input type="text" class="location-input" id="mapLocations" style="width:60%"
+      value="Chennai, Madurai, Coimbatore, Tiruchirapalli, Salem, Tirunelveli" />
+    <button class="primary" id="mapLoad">Load</button>
+    <div style="height:14px;"></div>
+    <div id="map"></div>
+    <div class="risk-legend">
+      <span><span class="dot" style="background:var(--low)"></span> Low</span>
+      <span><span class="dot" style="background:var(--mod)"></span> Moderate</span>
+      <span><span class="dot" style="background:var(--high)"></span> High</span>
+      <span><span class="dot" style="background:var(--severe)"></span> Severe</span>
+    </div>
+  </section>
+
+  <!-- ALERTS SCREEN -->
+  <section id="screen-alerts" class="screen panel">
+    <h3 style="margin-top:0;">Severe Weather Alerts</h3>
+    <input type="text" class="location-input" id="alertLocation" placeholder="Location, e.g. Chennai" />
+    <button class="primary" id="alertLoad">Check</button>
+    <div id="alertResults" style="margin-top:16px;"></div>
+  </section>
+
+  <!-- INSIGHTS SCREEN -->
+  <section id="screen-insights" class="screen panel">
+    <h3 style="margin-top:0;">Climate Insights</h3>
+    <input type="text" class="location-input" id="insightLocation" placeholder="Location, e.g. Madurai" />
+    <button class="primary" id="insightLoad">Show Trend</button>
+    <div style="height:14px;"></div>
+    <canvas id="insightChart" height="110"></canvas>
+    <div id="insightSummary" class="result-box" style="display:none;"></div>
+  </section>
+
+</main>
+
+<script>
+const API = "";
+
+// ---------- Navigation ----------
+document.querySelectorAll("nav button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById("screen-" + btn.dataset.screen).classList.add("active");
+  });
+});
+
+// ---------- Chat ----------
+const chatWindow = document.getElementById("chatWindow");
+const chatInput = document.getElementById("chatInput");
+const langSelect = document.getElementById("langSelect");
+
+function addMessage(text, who) {
+  const div = document.createElement("div");
+  div.className = "msg " + who;
+  div.textContent = text;
+  chatWindow.appendChild(div);
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+}
+
+async function sendChat(text) {
+  addMessage(text, "user");
+  chatInput.value = "";
+  const tamil = langSelect.value === "ta-IN";
+  try {
+    const res = await fetch(API + "/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, tamil }),
+    });
+    const data = await res.json();
+    addMessage(data.reply, "bot");
+    speak(data.reply);
+  } catch (e) {
+    addMessage("Sorry, I couldn't reach the weather service. Is the backend running?", "bot");
+  }
+}
+
+document.getElementById("sendBtn").addEventListener("click", () => {
+  const text = chatInput.value.trim();
+  if (text) sendChat(text);
+});
+chatInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const text = chatInput.value.trim();
+    if (text) sendChat(text);
+  }
+});
+document.querySelectorAll(".chip").forEach(chip => {
+  chip.addEventListener("click", () => sendChat(chip.dataset.q));
+});
+
+addMessage("Vanakkam! I'm WeatherGPT 🌦️ Ask me about current weather, forecasts, alerts, climate trends, or say things like \"Should I irrigate my field tomorrow?\"", "bot");
+
+// ---------- Voice (Web Speech API) ----------
+const micBtn = document.getElementById("micBtn");
+let recognizing = false;
+let recognition = null;
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+if (SpeechRecognition) {
+  recognition = new SpeechRecognition();
+  recognition.continuous = false;
+  recognition.interimResults = false;
+
+  recognition.onresult = (event) => {
+    const transcript = event.results[0][0].transcript;
+    chatInput.value = transcript;
+    sendChat(transcript);
+  };
+  recognition.onend = () => { recognizing = false; micBtn.classList.remove("listening"); };
+  recognition.onerror = () => { recognizing = false; micBtn.classList.remove("listening"); };
+} else {
+  micBtn.title = "Speech recognition not supported in this browser";
+}
+
+micBtn.addEventListener("click", () => {
+  if (!recognition) return;
+  recognition.lang = langSelect.value; // en-US or ta-IN
+  if (!recognizing) {
+    recognition.start();
+    recognizing = true;
+    micBtn.classList.add("listening");
+  } else {
+    recognition.stop();
+  }
+});
+
+function speak(text) {
+  if (!window.speechSynthesis) return;
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.lang = langSelect.value;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utter);
+}
+
+// ---------- Advisory ----------
+document.getElementById("advSubmit").addEventListener("click", async () => {
+  const location = document.getElementById("advLocation").value.trim();
+  const activity = document.getElementById("advActivity").value;
+  const days = document.getElementById("advDays").value;
+  const resultBox = document.getElementById("advResult");
+  if (!location) { resultBox.innerHTML = "<p class='muted'>Enter a location first.</p>"; return; }
+  resultBox.innerHTML = "<p class='muted'>Checking...</p>";
+  try {
+    const res = await fetch(`${API}/api/advisory?location=${encodeURIComponent(location)}&activity=${activity}&days_ahead=${days}`);
+    const data = await res.json();
+    if (data.detail) { resultBox.innerHTML = `<p class='muted'>${data.detail}</p>`; return; }
+    resultBox.innerHTML = `
+      <div class="result-box">
+        <div><span class="badge ${data.risk.level}">${data.risk.level} RISK</span></div>
+        <p style="margin:12px 0 4px;"><strong>${data.advisory.recommendation}</strong></p>
+        <p class="muted">${data.location.name}${data.location.admin1 ? ", " + data.location.admin1 : ""} · Reasons: ${data.risk.reasons.join(", ") || "none significant"}</p>
+      </div>`;
+  } catch (e) {
+    resultBox.innerHTML = "<p class='muted'>Could not fetch advisory.</p>";
+  }
+});
+
+// ---------- Map ----------
+let leafletMap = null;
+let markers = [];
+
+function riskColor(level) {
+  return { Low: "#4ade80", Moderate: "#fbbf24", High: "#fb923c", Severe: "#f87171" }[level] || "#93a2bd";
+}
+
+function initMap() {
+  if (leafletMap) return;
+  leafletMap = L.map('map', { zoomControl: true }).setView([11.0, 78.5], 6);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(leafletMap);
+}
+
+async function loadRiskMap() {
+  initMap();
+  const locsStr = document.getElementById("mapLocations").value;
+  markers.forEach(m => leafletMap.removeLayer(m));
+  markers = [];
+  try {
+    const res = await fetch(`${API}/api/risk_map?locations=${encodeURIComponent(locsStr)}`);
+    const data = await res.json();
+    data.results.forEach(r => {
+      const color = riskColor(r.risk.level);
+      const marker = L.circleMarker([r.location.latitude, r.location.longitude], {
+        radius: 12, fillColor: color, color: color, fillOpacity: 0.8, weight: 1
+      }).addTo(leafletMap);
+      marker.bindPopup(
+        `<strong>${r.location.name}</strong><br/>${r.current.temperature_c}°C, ${r.current.condition}<br/>` +
+        `Risk: <strong style="color:${color}">${r.risk.level}</strong><br/>` +
+        `Wind: ${r.current.windspeed_kmh} km/h · Rain: ${r.current.precipitation_mm} mm`
+      );
+      markers.push(marker);
+    });
+    if (data.results.length) {
+      const group = new L.featureGroup(markers);
+      leafletMap.fitBounds(group.getBounds().pad(0.3));
+    }
+  } catch (e) { /* noop */ }
+}
+document.getElementById("mapLoad").addEventListener("click", loadRiskMap);
+
+// ---------- Alerts ----------
+document.getElementById("alertLoad").addEventListener("click", async () => {
+  const location = document.getElementById("alertLocation").value.trim();
+  const box = document.getElementById("alertResults");
+  if (!location) { box.innerHTML = "<p class='muted'>Enter a location first.</p>"; return; }
+  box.innerHTML = "<p class='muted'>Checking...</p>";
+  try {
+    const res = await fetch(`${API}/api/weather/alerts?location=${encodeURIComponent(location)}`);
+    const data = await res.json();
+    if (!data.alerts || !data.alerts.length) {
+      box.innerHTML = `<p class="muted">No active alerts for ${data.location.name}.</p>`;
+      return;
+    }
+    box.innerHTML = data.alerts.map(a => `
+      <div class="alert-card ${a.severity}">
+        <div class="sev">${a.severity} · ${a.type}</div>
+        <div>${a.date}: ${a.message}</div>
+      </div>`).join("");
+  } catch (e) {
+    box.innerHTML = "<p class='muted'>Could not fetch alerts.</p>";
+  }
+});
+
+// ---------- Insights ----------
+let insightChartInstance = null;
+document.getElementById("insightLoad").addEventListener("click", async () => {
+  const location = document.getElementById("insightLocation").value.trim();
+  const summaryBox = document.getElementById("insightSummary");
+  if (!location) return;
+  summaryBox.style.display = "none";
+  try {
+    const res = await fetch(`${API}/api/weather/historical?location=${encodeURIComponent(location)}&days_back=180`);
+    const data = await res.json();
+    const ctx = document.getElementById("insightChart").getContext("2d");
+    if (insightChartInstance) insightChartInstance.destroy();
+    insightChartInstance = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: data.dates,
+        datasets: [
+          { label: 'Max Temp (°C)', data: data.temp_max_c, borderColor: '#fb923c', tension: 0.3, pointRadius: 0 },
+          { label: 'Min Temp (°C)', data: data.temp_min_c, borderColor: '#4fb8ff', tension: 0.3, pointRadius: 0 },
+        ]
+      },
+      options: {
+        responsive: true,
+        scales: {
+          x: { ticks: { color: '#93a2bd', maxTicksLimit: 8 }, grid: { color: '#1e2c48' } },
+          y: { ticks: { color: '#93a2bd' }, grid: { color: '#1e2c48' } }
+        },
+        plugins: { legend: { labels: { color: '#e8eefb' } } }
+      }
+    });
+    const avgMax = (data.temp_max_c.reduce((a,b) => a+b, 0) / data.temp_max_c.length).toFixed(1);
+    const totalRain = data.precipitation_mm.reduce((a,b) => a+b, 0).toFixed(1);
+    summaryBox.style.display = "block";
+    summaryBox.innerHTML = `Over the last <strong>${data.dates.length}</strong> days in <strong>${data.location.name}</strong>: average high <strong>${avgMax}°C</strong>, total rainfall <strong>${totalRain} mm</strong>.`;
+  } catch (e) {
+    summaryBox.style.display = "block";
+    summaryBox.innerHTML = "Could not load historical data.";
+  }
+});
+</script>
+
+</body>
+</html>
